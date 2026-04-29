@@ -1,13 +1,60 @@
-import { streamText, tool, zodSchema, stepCountIs } from 'ai';
-import { createOpenAI } from '@ai-sdk/openai';
-import { z } from 'zod';
 import { pipedrivePost } from '@/lib/pipedrive';
 import { supabaseServer } from '@/lib/supabase';
 
-const hub = createOpenAI({
-  baseURL: process.env.HUB_BASE_URL ?? 'https://hub.seazone.dev/v1',
-  apiKey: process.env.HUB_API_KEY!,
-});
+async function callHub(prompt: string): Promise<string> {
+  const res = await fetch(
+    `${process.env.HUB_BASE_URL ?? 'https://hub.seazone.dev/v1'}/chat/completions`,
+    {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.HUB_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        messages: [
+          {
+            role: 'system',
+            content: `Você é o Closer Assistant — agente pós-reunião da Seazone Investimentos.
+Analise as notas da reunião e retorne SOMENTE um JSON válido, sem texto adicional, no formato exato abaixo:
+{
+  "meeting_summary": "resumo de 3-5 frases",
+  "action_items": ["item 1", "item 2", "item 3"],
+  "follow_up_type": "hot|warm|cold|nurture",
+  "follow_up_justification": "justificativa em 1 frase",
+  "follow_up_script": "mensagem pronta para WhatsApp",
+  "pipedrive_note_html": "conteúdo HTML da nota para o Pipedrive",
+  "activity_subject": "assunto da atividade de follow-up",
+  "activity_type": "call|email|meeting|task",
+  "activity_due_date": "YYYY-MM-DD",
+  "activity_note": "observação sobre o follow-up",
+  "briefing_text": "texto completo formatado em markdown para mostrar ao closer"
+}`,
+          },
+          { role: 'user', content: prompt },
+        ],
+        max_tokens: 4000,
+        stream: false,
+      }),
+    }
+  );
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Hub API error ${res.status}: ${body.slice(0, 300)}`);
+  }
+  const data = await res.json();
+  return data.choices?.[0]?.message?.content ?? '';
+}
+
+function addBusinessDays(days: number): string {
+  const d = new Date();
+  let added = 0;
+  while (added < days) {
+    d.setDate(d.getDate() + 1);
+    if (d.getDay() !== 0 && d.getDay() !== 6) added++;
+  }
+  return d.toISOString().split('T')[0]!;
+}
 
 export async function POST(req: Request) {
   const body = await req.json();
@@ -15,120 +62,81 @@ export async function POST(req: Request) {
   const meetingNotes: string = body.meetingNotes ?? '';
   const token = process.env.PIPEDRIVE_API_TOKEN!;
 
-  const result = streamText({
-    model: hub('claude-sonnet-4-6'),
-    stopWhen: stepCountIs(8),
-    system: `Você é o Closer Assistant — agente pós-reunião da Seazone Investimentos.
-Missão: processar as notas da reunião e:
-1. Gerar resumo executivo
-2. Extrair action items concretos
-3. Classificar o follow-up (hot/warm/cold/nurture)
-4. Criar script de follow-up personalizado
-5. Criar nota no Pipedrive (create_pipedrive_note)
-6. Agendar atividade de follow-up (create_pipedrive_activity) — data estimada: +2 dias úteis
-7. Salvar debrief no banco (save_debrief)
+  if (!dealId || !meetingNotes) {
+    return Response.json({ error: 'Deal ID e notas da reunião são obrigatórios' }, { status: 400 });
+  }
 
-Zero input manual do closer. Tudo automatizado.
+  // Ask Claude to analyze meeting notes and return structured JSON
+  const rawResponse = await callHub(
+    `Deal ID: ${dealId}\n\nNotas da reunião:\n${meetingNotes}\n\nData de hoje: ${new Date().toISOString().split('T')[0]}\nData sugerida para follow-up (+2 dias úteis): ${addBusinessDays(2)}`
+  );
 
-## Formato do output:
+  // Parse the JSON response
+  let analysis: {
+    meeting_summary: string;
+    action_items: string[];
+    follow_up_type: 'hot' | 'warm' | 'cold' | 'nurture';
+    follow_up_justification: string;
+    follow_up_script: string;
+    pipedrive_note_html: string;
+    activity_subject: string;
+    activity_type: 'call' | 'email' | 'meeting' | 'task';
+    activity_due_date: string;
+    activity_note: string;
+    briefing_text: string;
+  };
 
-## 📝 Resumo da Reunião
-[3-5 frases resumindo o que foi discutido]
+  try {
+    const jsonMatch = rawResponse.match(/\{[\s\S]*\}/);
+    analysis = JSON.parse(jsonMatch?.[0] ?? rawResponse);
+  } catch {
+    return Response.json({ error: 'Erro ao processar resposta da IA', raw: rawResponse.slice(0, 500) }, { status: 500 });
+  }
 
-## ✅ Action Items
-[lista numerada de próximas ações concretas]
+  // Execute Pipedrive actions in parallel
+  const [noteResult, activityResult] = await Promise.allSettled([
+    pipedrivePost('notes', token, {
+      content: `<b>📋 Resumo gerado pelo Closer Assistant</b><br><br>${analysis.pipedrive_note_html}`,
+      deal_id: Number(dealId),
+    }),
+    pipedrivePost('activities', token, {
+      subject: analysis.activity_subject,
+      type: analysis.activity_type,
+      due_date: analysis.activity_due_date,
+      deal_id: Number(dealId),
+      note: analysis.activity_note,
+    }),
+  ]);
 
-## 🌡️ Temperatura do Lead: [HOT/WARM/COLD/NURTURE]
-[justificativa em 1 frase]
+  const noteId = noteResult.status === 'fulfilled' ? String(noteResult.value?.id ?? '') : null;
+  const activityId = activityResult.status === 'fulfilled' ? String(activityResult.value?.id ?? '') : null;
 
-## 💬 Script de Follow-up
-[mensagem pronta para WhatsApp, personalizada com o que foi discutido]
+  // Save debrief to database
+  await supabaseServer().from('ca_debriefs').insert({
+    deal_id: dealId,
+    meeting_notes_raw: meetingNotes,
+    meeting_summary: analysis.meeting_summary,
+    action_items: analysis.action_items,
+    follow_up_type: analysis.follow_up_type,
+    follow_up_script: analysis.follow_up_script,
+    pipedrive_updated: true,
+    pipedrive_note_id: noteId,
+    pipedrive_activity_id: activityId,
+  }).then(() => {}, () => {});
 
-## 🔄 Pipedrive Atualizado
-[confirmação do que foi criado no CRM]`,
-    messages: [
-      {
-        role: 'user',
-        content: `Deal ID: ${dealId}\n\nNotas da reunião:\n${meetingNotes}`,
-      },
-    ],
-    tools: {
-      create_pipedrive_note: tool({
-        description: 'Cria uma nota no deal do Pipedrive com o resumo da reunião',
-        inputSchema: zodSchema(z.object({
-          deal_id: z.string(),
-          content: z.string().describe('Conteúdo HTML da nota'),
-        })),
-        execute: async (input) => {
-          try {
-            const note = await pipedrivePost('notes', token, {
-              content: `<b>📋 Resumo gerado pelo Closer Assistant</b><br><br>${input.content}`,
-              deal_id: Number(input.deal_id),
-            });
-            return { success: true, note_id: note?.id };
-          } catch (e) {
-            return { success: false, error: String(e) };
-          }
-        },
-      }),
-
-      create_pipedrive_activity: tool({
-        description: 'Cria uma atividade de follow-up no Pipedrive',
-        inputSchema: zodSchema(z.object({
-          deal_id: z.string(),
-          subject: z.string().describe('Assunto da atividade'),
-          activity_type: z.enum(['call', 'email', 'meeting', 'task']),
-          due_date: z.string().describe('Data no formato YYYY-MM-DD'),
-          note: z.string().describe('Observação sobre o follow-up'),
-        })),
-        execute: async (input) => {
-          try {
-            const activity = await pipedrivePost('activities', token, {
-              subject: input.subject,
-              type: input.activity_type,
-              due_date: input.due_date,
-              deal_id: Number(input.deal_id),
-              note: input.note,
-            });
-            return { success: true, activity_id: activity?.id };
-          } catch (e) {
-            return { success: false, error: String(e) };
-          }
-        },
-      }),
-
-      save_debrief: tool({
-        description: 'Salva o debrief completo no banco de dados',
-        inputSchema: zodSchema(z.object({
-          deal_id: z.string(),
-          meeting_summary: z.string(),
-          action_items: z.array(z.string()),
-          follow_up_type: z.enum(['hot', 'warm', 'cold', 'nurture']),
-          follow_up_script: z.string(),
-          pipedrive_note_id: z.string().optional(),
-          pipedrive_activity_id: z.string().optional(),
-        })),
-        execute: async (input) => {
-          try {
-            await supabaseServer().from('ca_debriefs').insert({
-              deal_id: input.deal_id,
-              meeting_notes_raw: meetingNotes,
-              meeting_summary: input.meeting_summary,
-              action_items: input.action_items,
-              follow_up_type: input.follow_up_type,
-              follow_up_script: input.follow_up_script,
-              pipedrive_updated: true,
-              pipedrive_note_id: input.pipedrive_note_id || null,
-              pipedrive_activity_id: input.pipedrive_activity_id || null,
-            });
-            return { success: true };
-          } catch (e) {
-            return { success: false, error: String(e) };
-          }
-        },
-      }),
+  return Response.json({
+    briefing: analysis.briefing_text,
+    meeting_summary: analysis.meeting_summary,
+    action_items: analysis.action_items,
+    follow_up_type: analysis.follow_up_type,
+    follow_up_justification: analysis.follow_up_justification,
+    follow_up_script: analysis.follow_up_script,
+    pipedrive: {
+      note_created: noteResult.status === 'fulfilled',
+      note_id: noteId,
+      activity_created: activityResult.status === 'fulfilled',
+      activity_id: activityId,
+      activity_due_date: analysis.activity_due_date,
     },
   });
-
-  return result.toUIMessageStreamResponse();
 }
