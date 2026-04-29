@@ -4,9 +4,9 @@ import { z } from 'zod';
 import { pipedrivePost } from '@/lib/pipedrive';
 import { supabaseServer } from '@/lib/supabase';
 
-const openrouter = createOpenAI({
-  baseURL: 'https://openrouter.ai/api/v1',
-  apiKey: process.env.OPENROUTER_API_KEY!,
+const hub = createOpenAI({
+  baseURL: process.env.HUB_BASE_URL ?? 'https://hub.seazone.dev/v1',
+  apiKey: process.env.HUB_API_KEY!,
 });
 
 export async function POST(req: Request) {
@@ -16,7 +16,7 @@ export async function POST(req: Request) {
   const token = process.env.PIPEDRIVE_API_TOKEN!;
 
   const result = streamText({
-    model: openrouter('anthropic/claude-sonnet-4-6'),
+    model: hub('claude-sonnet-4-6'),
     stopWhen: stepCountIs(8),
     system: `Você é o Closer Assistant — agente pós-reunião da Seazone Investimentos.
 Missão: processar as notas da reunião e:
